@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+pydantic
+streamlit
+requests
+python-dotenv
+streamlit-js-eval
+beautifulsoup4
+httpx
+pytest

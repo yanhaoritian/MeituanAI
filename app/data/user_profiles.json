@@ -1,0 +1,38 @@
+{
+  "u_demo": {
+    "liked_merchants": [
+      "m_1002"
+    ],
+    "disliked_merchants": [],
+    "tag_weights": {
+      "汤面": 1.0,
+      "酸辣": 1.0,
+      "暖胃": 1.0,
+      "面食": 1.0
+    },
+    "events": [
+      {
+        "merchant_id": "m_1002",
+        "action": "like"
+      }
+    ]
+  },
+  "u_demo2": {
+    "liked_merchants": [],
+    "disliked_merchants": [
+      "m_1003"
+    ],
+    "tag_weights": {
+      "汤粉": -1.0,
+      "清淡": -1.0,
+      "少油": -1.0,
+      "暖胃": -1.0
+    },
+    "events": [
+      {
+        "merchant_id": "m_1003",
+        "action": "dislike"
+      }
+    ]
+  }
+}

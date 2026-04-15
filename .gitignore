@@ -1,0 +1,8 @@
+.env
+__pycache__/
+.pytest_cache/
+*.pyc
+*.sqlite3
+app/data/reason_metrics_logs/*.jsonl
+app/data/crawl_cache.json
+.venv/
