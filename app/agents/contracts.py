@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal
 
 
-AgentMode = Literal["recommend", "qa", "smalltalk", "reset", "fallback"]
+AgentMode = Literal["recommend", "qa", "mixed_intent", "smalltalk", "reset", "fallback"]
 
 
 @dataclass

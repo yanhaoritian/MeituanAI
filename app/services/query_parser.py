@@ -34,7 +34,7 @@ def _extract_distance(text: str) -> float | None:
 
     if "附近" in text or "就近" in text:
         return 3.0
-    if "远点没事" in text or "远一点也行" in text:
+    if any(k in text for k in ["远点没事", "远一点也行", "远距离也可以", "远一些也可以", "远点也行"]):
         return 8.0
     return None
 
@@ -53,7 +53,7 @@ def _extract_delivery_eta(text: str) -> int | None:
     match = re.search(r"(\d+)\s*分钟(?:内|以内|送达)?", text)
     if match:
         return int(match.group(1))
-    if "送达快" in text or "快一点" in text or "尽快" in text:
+    if "送达快" in text or "送得快" in text or "快一点" in text or "尽快" in text:
         return 40
     return None
 
@@ -66,7 +66,35 @@ def _extract_restrictions(text: str) -> List[str]:
         restrictions.append("high_protein")
     if "低碳" in text:
         restrictions.append("low_carb")
+    if any(k in text for k in ["想吃肉", "吃肉", "来点肉", "要肉", "荤一点", "多点肉"]):
+        restrictions.append("prefer_meat")
+    if any(k in text for k in ["不吃肉", "不要肉", "无肉", "不吃荤", "不要荤"]):
+        restrictions = [x for x in restrictions if x != "prefer_meat"]
     return restrictions
+
+
+def extract_directional_diet_restrictions(text: str) -> List[str]:
+    normalized = (text or "").strip()
+    if not normalized:
+        return []
+
+    wants_veg = any(k in normalized for k in ["素菜", "素食", "吃素", "全素", "斋"])
+    no_meat = any(k in normalized for k in ["不吃肉", "不要肉", "别放肉", "无肉", "不要荤", "不吃荤"])
+    allow_meat = any(k in normalized for k in ["可以吃肉", "有肉也行", "荤素都可"])
+    explicit_meat = any(k in normalized for k in ["牛肉", "鸡肉", "羊肉", "猪肉", "排骨", "烤肉"])
+
+    out: List[str] = []
+    if (wants_veg or no_meat) and not (allow_meat and explicit_meat):
+        out.extend(["vegetarian", "no_meat"])
+    return out
+
+
+def apply_directional_constraints(query: str, parsed: ParsedQuery) -> ParsedQuery:
+    directional = extract_directional_diet_restrictions(query)
+    if directional:
+        merged = sorted(set((parsed.slots.dietary_restrictions or []) + directional))
+        parsed.slots.dietary_restrictions = merged
+    return parsed
 
 
 def _extract_intent(text: str) -> str:
@@ -103,9 +131,10 @@ def parse_query(query: str) -> ParsedQuery:
         dietary_restrictions=restrictions,
     )
 
-    return ParsedQuery(
+    parsed = ParsedQuery(
         intent=_extract_intent(query),
         slots=slots,
         confidence=0.8,
         conflict_flags=conflict_flags,
     )
+    return apply_directional_constraints(query, parsed)

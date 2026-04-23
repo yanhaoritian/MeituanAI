@@ -29,3 +29,23 @@ def test_parse_query_marks_conflicts() -> None:
 
     assert "cheap_vs_premium" in parsed.conflict_flags
     assert "raw_food_conflict" in parsed.conflict_flags
+
+
+def test_parse_query_extracts_directional_vegetarian_constraints() -> None:
+    parsed = parse_query("今天想吃素菜，不吃肉，最好清淡一点")
+
+    assert "vegetarian" in parsed.slots.dietary_restrictions
+    assert "no_meat" in parsed.slots.dietary_restrictions
+    assert "清淡" in parsed.slots.taste
+
+
+def test_parse_query_extracts_meat_and_fast_intent() -> None:
+    parsed = parse_query("想吃肉，送得快")
+
+    assert "prefer_meat" in parsed.slots.dietary_restrictions
+    assert parsed.slots.delivery_eta_max_min == 40
+
+
+def test_parse_query_extracts_relaxed_distance_intent() -> None:
+    parsed = parse_query("远距离也可以，再推荐一家")
+    assert parsed.slots.distance_max_km == 8.0

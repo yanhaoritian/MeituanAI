@@ -265,11 +265,13 @@ class ChatService:
                 debug = {"mode": "reset"}
             elif decision.mode == "qa":
                 assistant_reply, compare_cards = self._answer_question(payload.message, session)
+                qa_style = self._response_agent.explain_style(payload.message)
                 assistant_reply = self._response_agent.finalize_reply(
                     base_text=assistant_reply,
                     mode="qa",
                     recs=session.get("last_recommendations", []) or [],
                     fast_mode=False,
+                    style_hint=qa_style,
                 )
                 mode = "qa"
                 debug = {
@@ -277,7 +279,12 @@ class ChatService:
                     "used_last_recommendations": bool(session.get("last_recommendations")),
                     "compare_cards_count": len(compare_cards),
                 }
-            elif decision.mode == "recommend":
+            elif decision.mode in ("recommend", "mixed_intent"):
+                pref_note = ""
+                if decision.mode == "mixed_intent":
+                    qa_hint, _ = self._answer_question(payload.message, session)
+                    if qa_hint:
+                        pref_note = f"{qa_hint}\n\n"
                 merged_query, rewrite_status = self._memory_agent.build_query(
                     message=payload.message,
                     last_query=str(session.get("last_query", "")),
@@ -290,7 +297,7 @@ class ChatService:
                 if rewrite_status == "followup_merged":
                     scope_ids = list(session.get("last_scope_ids", []) or [])
                     fast_mode = True
-                    if any(k in payload.message for k in ["换", "更近", "换个", "另一家"]):
+                    if any(k in payload.message for k in ["换", "更近", "换个", "另一家", "再推荐一家", "再来一家", "再给一家"]):
                         top_prev = (session.get("last_recommendations", []) or [{}])[0].get("merchant_id")
                         if top_prev:
                             exclude_ids.append(str(top_prev))
@@ -298,6 +305,11 @@ class ChatService:
                         prev_dist = (session.get("last_top_metrics") or {}).get("distance_km")
                         if isinstance(prev_dist, (float, int)):
                             require_closer_than_km = float(prev_dist)
+                    if hard.get("relax_distance"):
+                        # User explicitly allows farther candidates: unlock scope and avoid inheriting strict near-distance phrasing.
+                        scope_ids = []
+                        fast_mode = False
+                        merged_query = f"{payload.message}；8公里内也可接受"
                 t0 = time.perf_counter()
                 retrieval_result = self._retrieval_agent.recommend_with_scope_fallback(
                     user_id=payload.user_id,
@@ -328,15 +340,17 @@ class ChatService:
                     ).__dict__
                 )
                 assistant_reply = self._response_agent.build_recommend_reply(query=merged_query, recs=recs)
+                recommend_style = self._response_agent.explain_style(merged_query)
                 if hard.get("require_closer") and not recs:
                     assistant_reply = "我按“更近”这个硬条件筛过了，当前附近没有比上一家更近且满足你条件的店了。要不要我改成“更快送达”再给你一版？"
                 if scope_debug.get("scope_fallback_unlocked"):
                     assistant_reply = f"{assistant_reply}（这轮在原备选里无可行结果，我已自动扩展到全量店铺继续找）"
                 assistant_reply = self._response_agent.finalize_reply(
-                    base_text=assistant_reply,
+                    base_text=f"{pref_note}{assistant_reply}" if pref_note else assistant_reply,
                     mode="recommend",
                     recs=recs,
                     fast_mode=fast_mode,
+                    style_hint=recommend_style,
                 )
                 session["last_query"] = merged_query
                 session["last_trace_id"] = trace_id
@@ -349,7 +363,7 @@ class ChatService:
                 snapshot = (scope_debug.get("recommend_debug") or {}).get("selected_snapshot", [])
                 session["last_top_metrics"] = snapshot[0] if snapshot else {}
                 debug = {
-                    "mode": "recommend",
+                    "mode": "mixed_intent" if decision.mode == "mixed_intent" else "recommend",
                     "rewrite_status": rewrite_status,
                     "scope_locked": scope_debug.get("scope_locked", bool(scope_ids)),
                     "scope_fallback_unlocked": scope_debug.get("scope_fallback_unlocked", False),
@@ -360,6 +374,7 @@ class ChatService:
                     "recommend_debug": scope_debug.get("recommend_debug", {}),
                     "known_constraints": self._response_agent.extract_known_constraints(merged_query),
                     "memory": session.get("memory", {}),
+                    "constraint_layers": (session.get("memory", {}) or {}).get("constraint_layers", {}),
                 }
                 mode = "recommend"
             elif decision.mode == "smalltalk":

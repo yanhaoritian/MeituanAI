@@ -24,6 +24,7 @@ from app.services.recommender import RecommenderService
 load_dotenv()
 
 app = FastAPI(title="Meituan AI-Diet API", version="0.1.0")
+location_api_enabled = os.getenv("ENABLE_LOCATION_API", "false").lower() == "true"
 
 base_dir = Path(__file__).resolve().parent
 chat_storage_path = Path(os.getenv("CHAT_STORAGE_PATH", str(base_dir / "data" / "chat_sessions.json")))
@@ -65,24 +66,38 @@ def feedback(payload: FeedbackRequest) -> FeedbackResponse:
 
 @app.get("/v1/location/geocode")
 def geocode(address: str = Query(..., min_length=2), city: str = "") -> dict:
+    if not location_api_enabled:
+        return {"ok": False, "status": "location_api_disabled", "data": {}}
     data, status = amap_service.resolve_address(address=address, city=city)
     return {"ok": status.startswith("ok"), "status": status, "data": data}
 
 
 @app.get("/v1/location/ip")
 def locate_by_ip() -> dict:
+    if not location_api_enabled:
+        return {"ok": False, "status": "location_api_disabled", "data": {}}
     data, status = amap_service.ip_locate()
     return {"ok": status == "ok", "status": status, "data": data}
 
 
 @app.get("/v1/location/reverse")
 def reverse_geocode(lat: float, lng: float) -> dict:
+    if not location_api_enabled:
+        return {"ok": False, "status": "location_api_disabled", "data": {}}
     data, status = amap_service.reverse_geocode(location=Location(lat=lat, lng=lng))
     return {"ok": status == "ok", "status": status, "data": data}
 
 
 @app.get("/v1/location/health")
 def location_health(test_lat: float = 31.2304, test_lng: float = 121.4737) -> dict:
+    if not location_api_enabled:
+        return {
+            "ok": False,
+            "probe_source": "disabled",
+            "probe_reason": "location_api_disabled",
+            "probe_location": {"lat": test_lat, "lng": test_lng},
+            "checks": {},
+        }
     checks = {}
 
     key_ok = amap_service.enabled()

@@ -6,6 +6,42 @@ from typing import Dict, List, Tuple
 from app.schemas import ParsedQuery
 
 
+def _meat_keyword_hits(merchant: Dict) -> int:
+    text = (
+        f"{merchant.get('name', '')} "
+        f"{' '.join(merchant.get('tags', []))} "
+        f"{merchant.get('description', '')} "
+        f"{' '.join(merchant.get('recommended_dishes', []))}"
+    ).lower()
+    meat_keywords = [
+        "牛肉",
+        "鸡肉",
+        "猪肉",
+        "羊肉",
+        "排骨",
+        "烤肉",
+        "肥牛",
+        "鸡腿",
+        "beef",
+        "chicken",
+        "pork",
+        "lamb",
+    ]
+    return sum(1 for k in meat_keywords if k in text)
+
+
+def _is_vegetarian_friendly(merchant: Dict) -> bool:
+    text = (
+        f"{merchant.get('name', '')} "
+        f"{' '.join(merchant.get('tags', []))} "
+        f"{merchant.get('description', '')} "
+        f"{' '.join(merchant.get('recommended_dishes', []))}"
+    ).lower()
+    diet_flags = set(str(x) for x in merchant.get("diet_flags", []))
+    veg_keywords = ["素", "素食", "蔬菜", "豆腐", "菌菇", "vegetarian", "vegan"]
+    return "vegetarian_friendly" in diet_flags or any(k in text for k in veg_keywords)
+
+
 def is_beverage_merchant(merchant: Dict) -> bool:
     text = (
         f"{merchant.get('name', '')} "
@@ -81,6 +117,16 @@ def _merchant_health_score(parsed: ParsedQuery, merchant: Dict) -> float:
         score += 0.15
     if "high_protein" in restrictions and "high_protein" in diet_flags:
         score += 0.15
+    if "prefer_meat" in restrictions:
+        if _meat_keyword_hits(merchant) > 0:
+            score += 0.18
+        if _is_vegetarian_friendly(merchant):
+            score -= 0.08
+    if "vegetarian" in restrictions or "no_meat" in restrictions:
+        if _is_vegetarian_friendly(merchant):
+            score += 0.2
+        if _meat_keyword_hits(merchant) > 0:
+            score -= 0.25
 
     if any(k in tastes for k in ["减脂", "清淡", "不油腻", "高蛋白"]):
         if any(k in text for k in ["炸鸡", "奶茶", "烧烤", "肥牛拌饭", "重口", "油炸"]):
@@ -132,6 +178,10 @@ def filter_merchants(parsed: ParsedQuery, merchants: List[Dict]) -> Tuple[List[D
         if "no_raw" in parsed.slots.dietary_restrictions and "raw_food" in m.get("diet_flags", []):
             reasons["filtered_out"]["restriction"] += 1
             continue
+        if "no_meat" in parsed.slots.dietary_restrictions:
+            if _meat_keyword_hits(m) > 0 and not _is_vegetarian_friendly(m):
+                reasons["filtered_out"]["restriction"] += 1
+                continue
 
         filtered.append(m)
 
@@ -233,12 +283,19 @@ def pick_recommended_dishes(parsed: ParsedQuery, merchant: Dict, top_k: int = 3)
         return []
 
     terms = parsed.slots.taste + parsed.slots.category
-    if not terms:
+    no_meat_mode = "no_meat" in set(parsed.slots.dietary_restrictions or [])
+    prefer_meat_mode = "prefer_meat" in set(parsed.slots.dietary_restrictions or [])
+    meat_dish_keywords = ["牛", "鸡", "猪", "羊", "排骨", "肥牛", "beef", "chicken", "pork", "lamb"]
+    if not terms and not no_meat_mode and not prefer_meat_mode:
         return dishes[:top_k]
 
     scored = []
     for d in dishes:
         score = sum(1 for t in terms if t in d)
+        if no_meat_mode and any(k in str(d).lower() for k in meat_dish_keywords):
+            score -= 2
+        if prefer_meat_mode and any(k in str(d).lower() for k in meat_dish_keywords):
+            score += 2
         score += random.uniform(0, 0.01)
         scored.append((score, d))
     scored.sort(reverse=True, key=lambda x: x[0])

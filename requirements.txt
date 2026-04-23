@@ -8,3 +8,4 @@ streamlit-js-eval
 beautifulsoup4
 httpx
 pytest
+langchain-openai

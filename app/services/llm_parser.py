@@ -6,11 +6,38 @@ import re
 from typing import Any, Dict, Optional, Tuple
 
 import requests
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from requests.exceptions import SSLError
 import urllib3
 from urllib3.exceptions import InsecureRequestWarning
 
 from app.schemas import ParsedQuery, ParsedSlots
+from app.services.langchain_client import (
+    invoke_chat_via_langchain,
+    invoke_chat_via_requests,
+    normalize_chat_api_url,
+    use_langchain_llm,
+)
+
+
+class _LLMParsedSlots(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    taste: list[str] = Field(default_factory=list)
+    category: list[str] = Field(default_factory=list)
+    budget_max: Optional[float] = None
+    distance_max_km: Optional[float] = None
+    delivery_eta_max_min: Optional[int] = None
+    dietary_restrictions: list[str] = Field(default_factory=list)
+
+
+class _LLMParsedQuery(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    intent: str = "order_food"
+    slots: _LLMParsedSlots = Field(default_factory=_LLMParsedSlots)
+    confidence: float = 0.75
+    conflict_flags: list[str] = Field(default_factory=list)
 
 
 def _to_list(value: Any) -> list[str]:
@@ -41,29 +68,6 @@ def _to_int(value: Any) -> Optional[int]:
     return int(num) if num is not None else None
 
 
-def _extract_content(data: Dict[str, Any]) -> str:
-    choices = data.get("choices", [])
-    if not choices:
-        return "{}"
-    message = choices[0].get("message", {})
-    content = message.get("content", "{}")
-    # Some gateways return content as blocks.
-    if isinstance(content, list):
-        text_parts = []
-        for c in content:
-            if isinstance(c, dict):
-                if c.get("type") == "text":
-                    text_parts.append(str(c.get("text", "")))
-            else:
-                text_parts.append(str(c))
-        content = "".join(text_parts)
-    content = str(content).strip()
-    # Strip markdown fences if present.
-    content = re.sub(r"^```(?:json)?\s*", "", content)
-    content = re.sub(r"\s*```$", "", content)
-    return content.strip()
-
-
 def _to_parsed_query(payload: Dict[str, Any]) -> ParsedQuery:
     slots = payload.get("slots", {}) if isinstance(payload, dict) else {}
     return ParsedQuery(
@@ -81,16 +85,16 @@ def _to_parsed_query(payload: Dict[str, Any]) -> ParsedQuery:
     )
 
 
-def _normalize_api_url(raw_url: str) -> str:
-    if raw_url.endswith("/v1/chat/completions"):
-        return raw_url
-    if raw_url.endswith("/"):
-        raw_url = raw_url[:-1]
-    if raw_url.endswith("/v1"):
-        return f"{raw_url}/chat/completions"
-    if raw_url.startswith("http"):
-        return f"{raw_url}/v1/chat/completions"
-    return "https://api.openai.com/v1/chat/completions"
+def _parse_llm_content(content: str) -> Tuple[Optional[ParsedQuery], str]:
+    try:
+        raw_payload = json.loads(content or "{}")
+    except json.JSONDecodeError:
+        return None, "llm_invalid_json"
+    try:
+        validated = _LLMParsedQuery.model_validate(raw_payload)
+    except ValidationError:
+        return None, "llm_invalid_schema"
+    return _to_parsed_query(validated.model_dump()), "ok_validated_schema"
 
 
 def parse_query_by_llm(query: str) -> Tuple[Optional[ParsedQuery], str]:
@@ -99,7 +103,7 @@ def parse_query_by_llm(query: str) -> Tuple[Optional[ParsedQuery], str]:
     if not api_key:
         return None, "missing_api_key"
 
-    api_url = _normalize_api_url(os.getenv("LLM_API_URL", "https://api.openai.com/v1/chat/completions"))
+    api_url = normalize_chat_api_url(os.getenv("LLM_API_URL", "https://api.openai.com/v1/chat/completions"))
     timeout_sec = int(os.getenv("LLM_TIMEOUT_SEC", "8"))
     verify_ssl = os.getenv("LLM_VERIFY_SSL", "true").lower() == "true"
     suppress_warn = os.getenv("SUPPRESS_INSECURE_WARNING", "true").lower() == "true"
@@ -113,33 +117,61 @@ def parse_query_by_llm(query: str) -> Tuple[Optional[ParsedQuery], str]:
         "不要输出额外文本。"
     )
 
-    req = {
-        "model": model,
-        "temperature": 0,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": query},
-        ],
-        "response_format": {"type": "json_object"},
-    }
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-
     try:
+        if use_langchain_llm() and verify_ssl:
+            content, status = invoke_chat_via_langchain(
+                api_url=api_url,
+                api_key=api_key,
+                model=model,
+                timeout_sec=timeout_sec,
+                system_prompt=system_prompt,
+                user_content=query,
+                temperature=0,
+                force_json_object=True,
+                run_name="parse_query_by_llm",
+                tags=["parser", "chat"],
+                metadata={"module": "llm_parser"},
+            )
+            parsed_query, parse_status = _parse_llm_content(content)
+            if parsed_query is None:
+                return None, parse_status
+            return parsed_query, f"{status}|{parse_status}"
+
         try:
-            resp = requests.post(api_url, headers=headers, json=req, timeout=timeout_sec, verify=verify_ssl)
-            resp.raise_for_status()
-            data = resp.json()
-            content = _extract_content(data)
-            parsed = json.loads(content)
-            return _to_parsed_query(parsed), "ok"
+            content, status = invoke_chat_via_requests(
+                requests_module=requests,
+                api_url=api_url,
+                api_key=api_key,
+                model=model,
+                timeout_sec=timeout_sec,
+                verify_ssl=verify_ssl,
+                system_prompt=system_prompt,
+                user_content=query,
+                temperature=0,
+                force_json_object=True,
+            )
+            parsed_query, parse_status = _parse_llm_content(content)
+            if parsed_query is None:
+                return None, parse_status
+            return parsed_query, f"{status}|{parse_status}"
         except SSLError:
             # Some third-party gateways have unstable cert chains.
             # Retry once with verify=False for compatibility.
-            resp = requests.post(api_url, headers=headers, json=req, timeout=timeout_sec, verify=False)
-            resp.raise_for_status()
-            data = resp.json()
-            content = _extract_content(data)
-            parsed = json.loads(content)
-            return _to_parsed_query(parsed), "ok_insecure_retry"
+            content, _ = invoke_chat_via_requests(
+                requests_module=requests,
+                api_url=api_url,
+                api_key=api_key,
+                model=model,
+                timeout_sec=timeout_sec,
+                verify_ssl=False,
+                system_prompt=system_prompt,
+                user_content=query,
+                temperature=0,
+                force_json_object=True,
+            )
+            parsed_query, parse_status = _parse_llm_content(content)
+            if parsed_query is None:
+                return None, parse_status
+            return parsed_query, f"ok_insecure_retry|{parse_status}"
     except Exception as exc:
         return None, f"llm_call_failed:{type(exc).__name__}"

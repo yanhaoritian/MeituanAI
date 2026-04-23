@@ -1,5 +1,5 @@
 from app.schemas import ParsedQuery, ParsedSlots
-from app.services.ranking_engine import filter_merchants, is_beverage_merchant, rank_merchants
+from app.services.ranking_engine import filter_merchants, is_beverage_merchant, pick_recommended_dishes, rank_merchants
 
 
 def _merchant(
@@ -131,3 +131,65 @@ def test_rank_merchants_prioritizes_health_friendly_merchant_for_diet_query() ->
 
     assert ranked[0]["id"] == "healthy_1"
     assert ranked[0]["score_breakdown"]["preference"] > ranked[1]["score_breakdown"]["preference"]
+
+
+def test_filter_merchants_excludes_meat_heavy_when_no_meat_requested() -> None:
+    parsed = ParsedQuery(
+        intent="order_food",
+        slots=ParsedSlots(
+            budget_max=40.0,
+            distance_max_km=3.0,
+            dietary_restrictions=["no_meat", "vegetarian"],
+        ),
+        confidence=0.8,
+        conflict_flags=[],
+    )
+    merchants = [
+        _merchant(
+            "veg_1",
+            name="素食小馆",
+            tags=["素食", "清淡"],
+            diet_flags=["vegetarian_friendly", "low_oil"],
+            description="主打素菜和豆制品",
+            recommended_dishes=["香菇青菜面", "番茄豆腐煲"],
+        ),
+        _merchant(
+            "meat_1",
+            name="牛肉饭",
+            tags=["牛肉", "盖饭"],
+            diet_flags=[],
+            description="招牌牛肉饭和鸡腿饭",
+            recommended_dishes=["黑椒牛肉饭", "鸡腿饭"],
+        ),
+    ]
+
+    filtered, debug = filter_merchants(parsed, merchants)
+
+    assert [m["id"] for m in filtered] == ["veg_1"]
+    assert debug["filtered_out"]["restriction"] == 1
+
+
+def test_pick_recommended_dishes_prefers_meat_dishes_when_user_requests_meat() -> None:
+    parsed = ParsedQuery(
+        intent="order_food",
+        slots=ParsedSlots(
+            taste=[],
+            category=[],
+            budget_max=40.0,
+            distance_max_km=3.0,
+            dietary_restrictions=["prefer_meat"],
+        ),
+        confidence=0.8,
+        conflict_flags=[],
+    )
+    merchant = _merchant(
+        "mix_1",
+        name="家常馆",
+        tags=["家常菜"],
+        diet_flags=[],
+        description="荤素都有",
+        recommended_dishes=["香菇青菜饭", "红烧肉盖饭", "土豆牛肉饭"],
+    )
+
+    dishes = pick_recommended_dishes(parsed, merchant, top_k=2)
+    assert "红烧肉盖饭" in dishes or "土豆牛肉饭" in dishes

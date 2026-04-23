@@ -109,6 +109,35 @@ python scripts/chat_regression_check.py
 - 前端:
   - `FRONTEND_TIMEOUT_SEC`
 
+## LangChain 开关与灰度顺序
+
+### 新增开关
+
+- `USE_LANGCHAIN_LLM`
+  - `true`：`llm_parser`、`llm_reasoner`、`response_polisher` 优先走 LangChain 统一调用层
+  - `false`：回到 requests 调用层（保留兼容）
+- `SEMANTIC_BACKEND`
+  - `legacy_vector`（默认）：现有向量缓存+余弦评分方案
+  - `langchain_retriever`：使用 `langchain-openai` embeddings 方案（失败自动回退到 `legacy_vector`）
+- LangSmith（可选）
+  - `LANGSMITH_TRACING=true`
+  - `LANGSMITH_API_KEY=...`
+  - `LANGSMITH_PROJECT=...`
+
+### 推荐灰度顺序（建议依次开启）
+
+1. 先开启 `USE_LANGCHAIN_LLM=true`，只替换 parser/reasoner/polisher 调用层。
+2. 运行 `pytest` 与 `python scripts/chat_regression_check.py` 做一次基线对比。
+3. 再将 `SEMANTIC_BACKEND` 从 `legacy_vector` 切到 `langchain_retriever` 小流量验证。
+4. 观察日志中的解析状态、推荐耗时、失败回退比例，再决定是否全量切换。
+
+### 回滚策略
+
+- 任一步异常可直接回滚：
+  - `USE_LANGCHAIN_LLM=false`
+  - `SEMANTIC_BACKEND=legacy_vector`
+- 代码层已保留兼容分支，开关回滚后无需改业务代码。
+
 ## 数据文件
 
 - 商家样本：`app/data/merchants.json`

@@ -10,37 +10,13 @@ import requests
 import urllib3
 from urllib3.exceptions import InsecureRequestWarning
 
-
-def _normalize_api_url(raw_url: str) -> str:
-    if raw_url.endswith("/v1/chat/completions"):
-        return raw_url
-    if raw_url.endswith("/"):
-        raw_url = raw_url[:-1]
-    if raw_url.endswith("/v1"):
-        return f"{raw_url}/chat/completions"
-    if raw_url.startswith("http"):
-        return f"{raw_url}/v1/chat/completions"
-    return "https://api.openai.com/v1/chat/completions"
-
-
-def _extract_content(data: Dict) -> str:
-    choices = data.get("choices", [])
-    if not choices:
-        return ""
-    message = choices[0].get("message", {})
-    content = message.get("content", "")
-    if isinstance(content, list):
-        parts = []
-        for item in content:
-            if isinstance(item, dict) and item.get("type") == "text":
-                parts.append(str(item.get("text", "")))
-            else:
-                parts.append(str(item))
-        content = "".join(parts)
-    content = str(content).strip()
-    content = re.sub(r"^```(?:json)?\s*", "", content)
-    content = re.sub(r"\s*```$", "", content)
-    return content.strip()
+from app.services.langchain_client import (
+    invoke_chat_via_langchain,
+    invoke_chat_via_requests,
+    normalize_chat_api_url,
+    to_json_user_payload,
+    use_langchain_llm,
+)
 
 
 def _infer_user_scene(user_query: str) -> str:
@@ -80,6 +56,8 @@ def _reason_quality_score(text: str) -> int:
         score += 1
     if any(k in text for k in ["符合您的需求", "综合考虑", "推荐给您", "比较适合你"]):
         score -= 1
+    if any(k in text for k in ["首先", "其次", "综上", "因此推荐"]):
+        score -= 1
     return score
 
 
@@ -93,18 +71,36 @@ def _call_llm(
     system_prompt: str,
     user_payload: Dict,
 ) -> str:
-    req = {
-        "model": model,
-        "temperature": 0.6,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
-        ],
-    }
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    resp = requests.post(api_url, headers=headers, json=req, timeout=timeout_sec, verify=verify_ssl)
-    resp.raise_for_status()
-    return _extract_content(resp.json())
+    user_content = to_json_user_payload(user_payload)
+    reason_temperature = float(os.getenv("REASON_TEMPERATURE", "0.75"))
+    if use_langchain_llm() and verify_ssl:
+        text, _ = invoke_chat_via_langchain(
+            api_url=api_url,
+            api_key=api_key,
+            model=model,
+            timeout_sec=timeout_sec,
+            system_prompt=system_prompt,
+            user_content=user_content,
+            temperature=reason_temperature,
+            force_json_object=False,
+            run_name="generate_reason_by_llm",
+            tags=["reasoner", "chat"],
+            metadata={"module": "llm_reasoner"},
+        )
+        return text
+    text, _ = invoke_chat_via_requests(
+        requests_module=requests,
+        api_url=api_url,
+        api_key=api_key,
+        model=model,
+        timeout_sec=timeout_sec,
+        verify_ssl=verify_ssl,
+        system_prompt=system_prompt,
+        user_content=user_content,
+        temperature=reason_temperature,
+        force_json_object=False,
+    )
+    return text
 
 
 def generate_reason_by_llm(
@@ -117,7 +113,7 @@ def generate_reason_by_llm(
     if not api_key:
         return None, "missing_api_key"
 
-    api_url = _normalize_api_url(os.getenv("LLM_API_URL", "https://api.openai.com/v1/chat/completions"))
+    api_url = normalize_chat_api_url(os.getenv("LLM_API_URL", "https://api.openai.com/v1/chat/completions"))
     timeout_sec = int(os.getenv("REASON_TIMEOUT_SEC", os.getenv("LLM_TIMEOUT_SEC", "8")))
     verify_ssl = os.getenv("LLM_VERIFY_SSL", "true").lower() == "true"
     suppress_warn = os.getenv("SUPPRESS_INSECURE_WARNING", "true").lower() == "true"
@@ -148,8 +144,10 @@ def generate_reason_by_llm(
     system_prompt = (
         "你是外卖推荐解释器。请基于给定证据生成一句22-55字中文推荐理由。"
         "要求：1) 必须提到至少一个具体证据（预算/距离/时效/评分/口味/菜品）；"
-        "2) 语气自然，像懂用户场景的助手；3) 尽量包含轻微权衡表达（如虽然...但...）；"
-        "4) 禁止空泛模板化套话；5) 仅输出一句话，不要JSON。"
+        "2) 语气自然、口语化，像懂用户场景的朋友，不要客服腔；"
+        "3) 尽量包含轻微权衡表达（如虽然...但...）；"
+        "4) 禁止空泛模板化套话，避免“综合考虑、推荐给您、符合您的需求”；"
+        "5) 仅输出一句话，不要JSON。"
     )
 
     try:
@@ -169,7 +167,7 @@ def generate_reason_by_llm(
             rewrite_prompt = {
                 **prompt,
                 "first_draft": text,
-                "rewrite_target": "让理由更有场景感，避免模板口吻，必须带具体证据词。",
+                "rewrite_target": "让理由更像真人对话，带一点场景感，避免客服模板口吻，且必须带具体证据词。",
             }
             rewritten = _call_llm(
                 api_url=api_url,

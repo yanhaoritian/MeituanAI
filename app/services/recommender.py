@@ -6,7 +6,7 @@ import re
 from datetime import datetime
 from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 from app.schemas import FeedbackResponse, RecommendationItem, RecommendRequest, RecommendResponse
 from app.services.amap_service import AmapPoiService
@@ -17,7 +17,7 @@ from app.services.menu_service import MenuService
 from app.services.metrics_logger import ReasonMetricsLogger
 from app.services.policy_engine import apply_defaults_and_policy
 from app.services.profile_service import ProfileService
-from app.services.query_parser import parse_query
+from app.services.query_parser import apply_directional_constraints, parse_query
 from app.services.ranking_engine import (
     build_reason,
     filter_merchants,
@@ -44,6 +44,84 @@ class RecommenderService:
         self._menu_service = menu_service
         self._metrics_logger = metrics_logger
         self._semantic_service = SemanticService()
+
+    def _multi_recall_enabled(self) -> bool:
+        return os.getenv("ENABLE_MULTI_RECALL", "false").lower() == "true"
+
+    def _term_hit_count(self, parsed, merchant: Dict) -> int:
+        terms = list(parsed.slots.taste or []) + list(parsed.slots.category or [])
+        if "no_meat" in (parsed.slots.dietary_restrictions or []):
+            terms.extend(["素", "豆腐", "蔬菜", "菌菇"])
+        haystack = (
+            f"{merchant.get('name', '')} "
+            f"{' '.join(merchant.get('tags', []))} "
+            f"{merchant.get('description', '')}"
+        )
+        return sum(1 for t in terms if t and t in haystack)
+
+    def _build_multi_recall_pool(
+        self,
+        *,
+        user_id: str,
+        parsed,
+        candidates: List[Dict],
+        semantic_scores: Dict[str, float],
+    ) -> Tuple[List[Dict], Dict]:
+        if not candidates:
+            return candidates, {"enabled": False, "reason": "no_candidates"}
+        profile = self._profile_service.get_profile(user_id)
+        liked_ids = set(str(x) for x in (profile.get("liked_merchants") or []))
+
+        rule_top_k = int(os.getenv("MULTI_RECALL_RULE_TOP_K", "80"))
+        semantic_top_k = int(os.getenv("MULTI_RECALL_SEMANTIC_TOP_K", "50"))
+        preference_top_k = int(os.getenv("MULTI_RECALL_PREF_TOP_K", "30"))
+
+        by_id = {str(m.get("id", "")): m for m in candidates}
+        rule_sorted = sorted(
+            candidates,
+            key=lambda m: (self._term_hit_count(parsed, m), float(m.get("rating", 0.0))),
+            reverse=True,
+        )
+        semantic_sorted = sorted(
+            candidates,
+            key=lambda m: float(semantic_scores.get(str(m.get("id", "")), 0.0)),
+            reverse=True,
+        )
+        pref_sorted = [m for m in candidates if str(m.get("id", "")) in liked_ids]
+
+        route_rule = [str(m.get("id", "")) for m in rule_sorted[: max(0, rule_top_k)]]
+        route_semantic = [str(m.get("id", "")) for m in semantic_sorted[: max(0, semantic_top_k)]]
+        route_pref = [str(m.get("id", "")) for m in pref_sorted[: max(0, preference_top_k)]]
+
+        merged_ids: List[str] = []
+        for route in (route_pref, route_semantic, route_rule):
+            for mid in route:
+                if mid and mid not in merged_ids and mid in by_id:
+                    merged_ids.append(mid)
+        if not merged_ids:
+            return candidates, {"enabled": True, "reason": "empty_merged_use_all"}
+
+        min_pool = min(len(candidates), max(30, len(route_pref) + len(route_semantic)))
+        if len(merged_ids) < min_pool:
+            for m in rule_sorted:
+                mid = str(m.get("id", ""))
+                if mid not in merged_ids:
+                    merged_ids.append(mid)
+                if len(merged_ids) >= min_pool:
+                    break
+
+        pool = [by_id[mid] for mid in merged_ids if mid in by_id]
+        debug = {
+            "enabled": True,
+            "input_count": len(candidates),
+            "pool_count": len(pool),
+            "route_counts": {
+                "preference": len(route_pref),
+                "semantic": len(route_semantic),
+                "rule": len(route_rule),
+            },
+        }
+        return pool, debug
 
     def _apply_implicit_meal_policy(self, query: str, parsed) -> List[str]:
         """
@@ -300,7 +378,7 @@ class RecommenderService:
         merchants = self._repository.list_all()
         data_source = "mock_json"
         amap_status = "not_requested"
-        use_live_poi = os.getenv("USE_LIVE_POI", "true").lower() == "true"
+        use_live_poi = os.getenv("USE_LIVE_POI", "false").lower() == "true"
         if request.location and use_live_poi:
             live_merchants, amap_status = self._amap_service.fetch_nearby_merchants(request.location)
             if live_merchants:
@@ -334,6 +412,7 @@ class RecommenderService:
             if llm_parsed is not None:
                 parsed = llm_parsed
                 parser_source = "llm"
+        parsed = apply_directional_constraints(request.query, parsed)
 
         implicit_policy_notes = self._apply_implicit_meal_policy(request.query, parsed)
 
@@ -367,6 +446,17 @@ class RecommenderService:
                 parsed=parsed,
                 merchants=candidates,
             )
+        multi_recall_debug: Dict = {"enabled": False}
+        if self._multi_recall_enabled() and not request.fast_mode:
+            candidates, multi_recall_debug = self._build_multi_recall_pool(
+                user_id=request.user_id,
+                parsed=parsed,
+                candidates=candidates,
+                semantic_scores=semantic_scores,
+            )
+            # Recompute semantic on narrowed pool for consistent ranking signal.
+            semantic_scores = {str(m.get("id", "")): semantic_scores.get(str(m.get("id", "")), 0.0) for m in candidates}
+
         ranked = rank_merchants(parsed, candidates, semantic_scores=semantic_scores)
         ranked, backup_notes, backup_debug = self._fallback_rank_with_beverage_backup(
             parsed=parsed,
@@ -485,13 +575,18 @@ class RecommenderService:
             "policy": policy_debug,
             "filter": filter_debug,
             "candidate_count": len(candidates),
+            "multi_recall": multi_recall_debug,
             "merchant_scope_count": len(request.merchant_scope_ids or []),
             "merchant_exclude_count": len(request.exclude_merchant_ids or []),
             "selected_snapshot": selected_snapshot,
             "preference_applied": True,
             "beverage_backup": backup_debug,
             "semantic_status": semantic_status,
-            "semantic_source": "vector" if semantic_status.startswith("vector_ok") else "keyword_overlap",
+            "semantic_source": (
+                "vector"
+                if semantic_status.startswith("vector_ok") or semantic_status.startswith("langchain_ok")
+                else "keyword_overlap"
+            ),
             "fast_mode": request.fast_mode,
             "data_source": data_source,
             "amap_status": amap_status,

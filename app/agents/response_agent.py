@@ -1,19 +1,26 @@
 from __future__ import annotations
 
-import json
 import os
 import re
 from typing import Dict, List, Tuple
 
 import requests
+from app.services.langchain_client import (
+    invoke_chat_via_langchain,
+    invoke_chat_via_requests,
+    normalize_chat_api_url,
+    to_json_user_payload,
+    use_langchain_llm,
+)
 
 
 class ResponseAgent:
     def __init__(self) -> None:
         self._use_polisher = os.getenv("USE_RESPONSE_POLISHER", "true").lower() == "true"
         self._timeout_sec = int(os.getenv("RESPONSE_POLISH_TIMEOUT_SEC", "2"))
+        self._polish_temperature = float(os.getenv("RESPONSE_POLISH_TEMPERATURE", "0.45"))
         self._api_key = os.getenv("OPENAI_API_KEY", "").strip()
-        self._api_url = self._normalize_api_url(os.getenv("LLM_API_URL", "https://api.openai.com/v1/chat/completions"))
+        self._api_url = normalize_chat_api_url(os.getenv("LLM_API_URL", "https://api.openai.com/v1/chat/completions"))
         self._model = os.getenv("RESPONSE_POLISH_MODEL", os.getenv("REASON_MODEL", os.getenv("PARSER_MODEL", "gpt-4o-mini")))
 
     def _humanize(self, text: str) -> str:
@@ -22,36 +29,6 @@ class ResponseAgent:
         if text.endswith("。"):
             return text
         return f"{text}。"
-
-    def _normalize_api_url(self, raw_url: str) -> str:
-        if raw_url.endswith("/v1/chat/completions"):
-            return raw_url
-        if raw_url.endswith("/"):
-            raw_url = raw_url[:-1]
-        if raw_url.endswith("/v1"):
-            return f"{raw_url}/chat/completions"
-        if raw_url.startswith("http"):
-            return f"{raw_url}/v1/chat/completions"
-        return "https://api.openai.com/v1/chat/completions"
-
-    def _extract_content(self, data: Dict) -> str:
-        choices = data.get("choices", [])
-        if not choices:
-            return ""
-        msg = choices[0].get("message", {})
-        content = msg.get("content", "")
-        if isinstance(content, list):
-            parts = []
-            for item in content:
-                if isinstance(item, dict) and item.get("type") == "text":
-                    parts.append(str(item.get("text", "")))
-                else:
-                    parts.append(str(item))
-            content = "".join(parts)
-        content = str(content).strip()
-        content = re.sub(r"^```(?:json)?\s*", "", content)
-        content = re.sub(r"\s*```$", "", content)
-        return content.strip()
 
     def _guard_reply(self, *, text: str, recs: List[Dict[str, object]]) -> str:
         out = self._humanize(text.strip())
@@ -62,10 +39,59 @@ class ResponseAgent:
             out = f"{top_name}：{out}"
         # Avoid overly long verbose outputs in chat bubble.
         if len(out) > 220:
-            out = out[:220].rstrip("，；。 ") + "。"
+            out = self._trim_to_sentence(out, max_len=220)
         return out
 
-    def _polish(self, *, base_text: str, mode: str, recs: List[Dict[str, object]]) -> str:
+    def _trim_to_sentence(self, text: str, *, max_len: int) -> str:
+        if len(text) <= max_len:
+            return text
+        trimmed = text[:max_len]
+        for sep in ("。", "！", "？", "；"):
+            idx = trimmed.rfind(sep)
+            if idx >= max_len // 2:
+                return trimmed[: idx + 1].strip()
+        return trimmed.rstrip("，；。 ") + "。"
+
+    def _postprocess_polish_text(self, text: str) -> str:
+        out = (text or "").strip()
+        replacements = {
+            "综合考虑": "结合你这轮需求",
+            "推荐给您": "先给你推荐",
+            "比较适合你": "更贴近你这次的口味",
+            "符合您的需求": "和你这轮要求更对口",
+        }
+        for src, dst in replacements.items():
+            out = out.replace(src, dst)
+        out = re.sub(r"\s+", " ", out).strip()
+        out = self._trim_to_sentence(out, max_len=139)
+        return self._humanize(out)
+
+    def _detect_explain_style(self, text: str) -> str:
+        q = (text or "").strip()
+        if any(k in q for k in ["预算", "便宜", "实惠", "降到", "太贵"]):
+            return "budget"
+        if any(k in q for k in ["减脂", "清淡", "不油腻", "健康", "高蛋白", "控卡"]):
+            return "health"
+        if any(k in q for k in ["更快", "送达", "赶时间", "快一点", "分钟内"]):
+            return "speed"
+        if any(k in q for k in ["更近", "附近", "离我近", "距离"]):
+            return "distance"
+        return "balanced"
+
+    def explain_style(self, text: str) -> str:
+        return self._detect_explain_style(text)
+
+    def _style_preface(self, style: str) -> str:
+        mapping = {
+            "budget": "先按性价比给你挑，",
+            "health": "先按清淡健康这条线给你选，",
+            "speed": "先按送达时效优先给你排，",
+            "distance": "先按就近取餐给你筛，",
+            "balanced": "综合这轮条件看，",
+        }
+        return mapping.get(style, mapping["balanced"])
+
+    def _polish(self, *, base_text: str, mode: str, recs: List[Dict[str, object]], style_hint: str = "balanced") -> str:
         if not self._use_polisher or not self._api_key or not base_text.strip():
             return base_text
         try:
@@ -74,35 +100,61 @@ class ResponseAgent:
                 "mode": mode,
                 "text": base_text,
                 "top_name": top_name,
+                "style_hint": style_hint,
                 "constraint": "更像真人说话，简洁自然，不添加新事实，不改变推荐结论。",
             }
-            req = {
-                "model": self._model,
-                "temperature": 0.2,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": (
-                            "你是中文外卖助手文案润色器。"
-                            "请只做口语化润色，不新增事实，不更改店名/结论。"
-                            "输出1-2句，长度不超过120字。"
-                        ),
-                    },
-                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-                ],
-            }
-            headers = {"Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json"}
-            resp = requests.post(self._api_url, headers=headers, json=req, timeout=self._timeout_sec)
-            resp.raise_for_status()
-            text = self._extract_content(resp.json())
-            return text or base_text
+            system_prompt = (
+                "你是中文外卖助手文案润色器。"
+                "请只做口语化润色，不新增事实，不更改店名/结论。"
+                "风格要求：像朋友聊天，亲切、自然、有人味，不要客服腔和模板腔。"
+                "请根据 style_hint 对齐语气：budget(性价比)、health(清淡健康)、speed(时效)、distance(就近)、balanced(均衡)。"
+                "禁止使用“综合考虑、推荐给您、符合您的需求、比较适合你”等生硬表达。"
+                "输出1-2句，长度不超过130字。"
+            )
+            user_content = to_json_user_payload(payload)
+            if use_langchain_llm():
+                text, _ = invoke_chat_via_langchain(
+                    api_url=self._api_url,
+                    api_key=self._api_key,
+                    model=self._model,
+                    timeout_sec=self._timeout_sec,
+                    system_prompt=system_prompt,
+                    user_content=user_content,
+                    temperature=self._polish_temperature,
+                    force_json_object=False,
+                    run_name="response_polisher",
+                    tags=["polisher", "chat"],
+                    metadata={"module": "response_agent"},
+                )
+            else:
+                text, _ = invoke_chat_via_requests(
+                    requests_module=requests,
+                    api_url=self._api_url,
+                    api_key=self._api_key,
+                    model=self._model,
+                    timeout_sec=self._timeout_sec,
+                    verify_ssl=True,
+                    system_prompt=system_prompt,
+                    user_content=user_content,
+                    temperature=self._polish_temperature,
+                    force_json_object=False,
+                )
+            return self._postprocess_polish_text(text or base_text)
         except Exception:
             return base_text
 
-    def finalize_reply(self, *, base_text: str, mode: str, recs: List[Dict[str, object]], fast_mode: bool = False) -> str:
+    def finalize_reply(
+        self,
+        *,
+        base_text: str,
+        mode: str,
+        recs: List[Dict[str, object]],
+        fast_mode: bool = False,
+        style_hint: str = "balanced",
+    ) -> str:
         text = base_text
         if mode in ("recommend", "qa") and not fast_mode:
-            text = self._polish(base_text=base_text, mode=mode, recs=recs)
+            text = self._polish(base_text=base_text, mode=mode, recs=recs, style_hint=style_hint)
         return self._guard_reply(text=text, recs=recs)
 
     def build_compare_cards(self, recs: List[Dict[str, object]]) -> List[Dict[str, object]]:
@@ -215,12 +267,14 @@ class ResponseAgent:
     def build_recommend_reply(self, *, query: str, recs: List[Dict[str, object]]) -> str:
         if not recs:
             return "我按你的要求筛了一轮，暂时没找到特别合适的店。你可以放宽一点预算或距离，我马上再给你重排。"
+        style = self._detect_explain_style(query)
+        preface = self._style_preface(style)
         top = recs[0]
         top_name = top.get("name", "这家店")
         top_reason = top.get("reason", "")
         top_dishes = top.get("recommended_dishes", []) or []
         dish_text = f"，可以先试试“{top_dishes[0]}”" if top_dishes else ""
-        return self._humanize(f"按你这轮需求，我先给你排了更稳的一家：{top_name}{dish_text}。{top_reason}")
+        return self._humanize(f"{preface}{top_name}{dish_text}。{top_reason}")
 
     def suggestions(self, *, mode: str, recs: List[Dict[str, object]]) -> List[str]:
         if mode == "qa":

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 import requests
+from langchain_openai import OpenAIEmbeddings
 
 
 def _normalize_embedding_url(raw_url: str) -> str:
@@ -41,6 +42,8 @@ def _cosine(a: List[float], b: List[float]) -> float:
 class SemanticService:
     def __init__(self) -> None:
         self._enabled = os.getenv("USE_VECTOR_SEMANTIC", "true").lower() == "true"
+        raw_backend = os.getenv("SEMANTIC_BACKEND", "legacy_vector").strip().lower()
+        self._backend = raw_backend if raw_backend in {"legacy_vector", "langchain_retriever"} else "legacy_vector"
         self._timeout = int(os.getenv("EMBEDDING_TIMEOUT_SEC", os.getenv("LLM_TIMEOUT_SEC", "8")))
         self._api_key = os.getenv("OPENAI_API_KEY", "").strip()
         self._model = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small").strip()
@@ -84,6 +87,9 @@ class SemanticService:
     def enabled(self) -> bool:
         return self._enabled and bool(self._api_key) and bool(self._model)
 
+    def backend_name(self) -> str:
+        return self._backend
+
     def _merchant_text(self, merchant: Dict) -> str:
         name = str(merchant.get("name", ""))
         tags = " ".join(str(x) for x in merchant.get("tags", []))
@@ -113,6 +119,16 @@ class SemanticService:
                 raise ValueError("invalid_embedding_vector")
             vectors.append([float(x) for x in emb])
         return vectors
+
+    def _embed_texts_langchain(self, texts: List[str]) -> List[List[float]]:
+        emb = OpenAIEmbeddings(
+            model=self._model,
+            api_key=self._api_key,
+            base_url=self._api_url.replace("/embeddings", ""),
+            request_timeout=self._timeout,
+        )
+        vectors = emb.embed_documents(texts)
+        return [[float(x) for x in v] for v in vectors]
 
     def _merchant_cache_key(self, merchant: Dict, text: str) -> str:
         mid = str(merchant.get("id", ""))
@@ -195,41 +211,75 @@ class SemanticService:
                 )
                 conn.commit()
 
+    def _score_merchants_legacy_vector(self, *, user_query: str, parsed, merchants: List[Dict]) -> Tuple[Dict[str, float], str]:
+        q = self._query_text(user_query, parsed)
+        merchant_texts = [self._merchant_text(m) for m in merchants]
+        cached_vectors, missing, hit_count = self._load_cached_vectors(merchants, merchant_texts)
+
+        vectors = self._embed_texts([q, *[text for _, text in missing]])
+        q_vec = vectors[0]
+        if missing:
+            fresh_vectors = vectors[1:]
+            self._store_cached_vectors(
+                [
+                    (merchant, text, vec)
+                    for (merchant, text), vec in zip(missing, fresh_vectors)
+                ]
+            )
+            for (merchant, _), vec in zip(missing, fresh_vectors):
+                cached_vectors[str(merchant.get("id", ""))] = vec
+
+        scores: Dict[str, float] = {}
+        for merchant in merchants:
+            mid = str(merchant.get("id", ""))
+            vec = cached_vectors.get(mid)
+            if not vec:
+                continue
+            scores[mid] = round((_cosine(q_vec, vec) + 1.0) / 2.0, 4)
+
+        if len(scores) != len(merchants):
+            return {}, "vector_failed:missing_cached_vectors"
+        miss_count = len(missing)
+        return scores, f"vector_ok|cache_hits={hit_count}|cache_misses={miss_count}"
+
+    def _score_merchants_langchain_retriever(self, *, user_query: str, parsed, merchants: List[Dict]) -> Tuple[Dict[str, float], str]:
+        q = self._query_text(user_query, parsed)
+        merchant_texts = [self._merchant_text(m) for m in merchants]
+        vectors = self._embed_texts_langchain([q, *merchant_texts])
+        q_vec = vectors[0]
+        merchant_vecs = vectors[1:]
+        if len(merchant_vecs) != len(merchants):
+            return {}, "langchain_failed:invalid_vector_size"
+        scores: Dict[str, float] = {}
+        for merchant, vec in zip(merchants, merchant_vecs):
+            mid = str(merchant.get("id", ""))
+            scores[mid] = round((_cosine(q_vec, vec) + 1.0) / 2.0, 4)
+        return scores, f"langchain_ok|count={len(scores)}"
+
     def score_merchants(self, *, user_query: str, parsed, merchants: List[Dict]) -> Tuple[Dict[str, float], str]:
         if not self.enabled():
             return {}, "vector_disabled_or_missing_key"
         if not merchants:
             return {}, "vector_no_merchants"
         try:
-            q = self._query_text(user_query, parsed)
-            merchant_texts = [self._merchant_text(m) for m in merchants]
-            cached_vectors, missing, hit_count = self._load_cached_vectors(merchants, merchant_texts)
-
-            vectors = self._embed_texts([q, *[text for _, text in missing]])
-            q_vec = vectors[0]
-            if missing:
-                fresh_vectors = vectors[1:]
-                self._store_cached_vectors(
-                    [
-                        (merchant, text, vec)
-                        for (merchant, text), vec in zip(missing, fresh_vectors)
-                    ]
-                )
-                for (merchant, _), vec in zip(missing, fresh_vectors):
-                    cached_vectors[str(merchant.get("id", ""))] = vec
-
-            scores: Dict[str, float] = {}
-            for merchant in merchants:
-                mid = str(merchant.get("id", ""))
-                vec = cached_vectors.get(mid)
-                if not vec:
-                    continue
-                scores[mid] = round((_cosine(q_vec, vec) + 1.0) / 2.0, 4)
-
-            if len(scores) != len(merchants):
-                return {}, "vector_failed:missing_cached_vectors"
-
-            miss_count = len(missing)
-            return scores, f"vector_ok|cache_hits={hit_count}|cache_misses={miss_count}"
+            if self._backend == "langchain_retriever":
+                try:
+                    return self._score_merchants_langchain_retriever(
+                        user_query=user_query,
+                        parsed=parsed,
+                        merchants=merchants,
+                    )
+                except Exception as exc:
+                    fallback_scores, fallback_status = self._score_merchants_legacy_vector(
+                        user_query=user_query,
+                        parsed=parsed,
+                        merchants=merchants,
+                    )
+                    return fallback_scores, f"langchain_failed:{type(exc).__name__}|fallback={fallback_status}"
+            return self._score_merchants_legacy_vector(
+                user_query=user_query,
+                parsed=parsed,
+                merchants=merchants,
+            )
         except Exception as exc:
             return {}, f"vector_failed:{type(exc).__name__}"

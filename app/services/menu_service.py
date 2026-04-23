@@ -61,6 +61,9 @@ class MenuService:
         return bool(self._base_url)
 
     def fetch_menu(self, merchant: Dict) -> Tuple[List[str], str]:
+        if os.getenv("USE_VIRTUAL_MENU_ONLY", "true").lower() == "true":
+            local_menu = [str(x).strip() for x in (merchant.get("recommended_dishes", []) or []) if str(x).strip()]
+            return local_menu[:20], "virtual_menu_only"
         if not self.enabled():
             # Fallback to controlled web crawl when provider is unavailable.
             dishes, status, _ = self._crawler.crawl_menu(merchant.get("name", ""))

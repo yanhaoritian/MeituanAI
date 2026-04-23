@@ -13,6 +13,7 @@ except Exception:  # pragma: no cover
 load_dotenv()
 api_base = os.getenv("BACKEND_API_BASE", "http://127.0.0.1:8000")
 timeout_sec = int(os.getenv("FRONTEND_TIMEOUT_SEC", "20"))
+location_ui_enabled = os.getenv("ENABLE_LOCATION_UI", "false").lower() == "true"
 
 st.set_page_config(page_title="美团 AI 点餐助手", page_icon="🍱", layout="wide")
 st.title("🍱 美团 AI 点餐助手")
@@ -55,6 +56,58 @@ def _render_compare_cards(compare_cards: List[Dict[str, Any]]) -> None:
             st.caption(f"摘要：{card.get('reason_hint', '-')}")
 
 
+def _render_agent_panel() -> None:
+    st.markdown("### Agent级日志面板")
+    show_panel = st.toggle("显示Agent日志", value=False, key="agent_panel_toggle")
+    if not show_panel:
+        st.caption("开启后可查看每轮Agent决策、耗时与回退情况。")
+        return
+
+    assistant_msgs = [
+        m
+        for m in st.session_state.get("dialog_messages", [])
+        if m.get("role") == "assistant" and isinstance(m.get("debug"), dict)
+    ]
+    if not assistant_msgs:
+        st.info("当前还没有可展示的Agent日志。")
+        return
+
+    latest_debug = assistant_msgs[-1].get("debug", {})
+    latest_steps = latest_debug.get("agent_steps", []) or []
+    mode = latest_debug.get("mode", "-")
+    fast_mode = latest_debug.get("fast_mode", False)
+    fallback = latest_debug.get("scope_fallback_unlocked", False)
+
+    st.caption(f"最新轮：mode={mode} | fast_mode={fast_mode} | scope_fallback={fallback}")
+    if latest_steps:
+        step_cols = st.columns(min(3, len(latest_steps)))
+        for i, step in enumerate(latest_steps[:3]):
+            detail = step.get("detail", {}) or {}
+            latency = detail.get("latency_ms", "-")
+            with step_cols[i]:
+                st.metric(
+                    label=f"{step.get('agent', f'agent{i+1}')}",
+                    value=f"{step.get('status', '-')}",
+                    delta=f"{latency} ms" if latency != "-" else None,
+                )
+
+    with st.expander("查看最近5轮完整Agent日志", expanded=False):
+        recent = assistant_msgs[-5:]
+        for idx, msg in enumerate(reversed(recent), start=1):
+            dbg = msg.get("debug", {}) or {}
+            st.markdown(f"**第{idx}条（mode={dbg.get('mode', '-')})**")
+            st.json(
+                {
+                    "mode": dbg.get("mode"),
+                    "fast_mode": dbg.get("fast_mode"),
+                    "scope_fallback_unlocked": dbg.get("scope_fallback_unlocked"),
+                    "trace_id": dbg.get("trace_id"),
+                    "agent_steps": dbg.get("agent_steps", []),
+                    "known_constraints": dbg.get("known_constraints", []),
+                }
+            )
+
+
 def _send_chat_message(message: str, *, timeout_sec: int) -> None:
     st.session_state["dialog_messages"].append({"role": "user", "content": message, "recs": []})
     with st.chat_message("user"):
@@ -66,7 +119,7 @@ def _send_chat_message(message: str, *, timeout_sec: int) -> None:
         }
         if st.session_state.get("chat_session_id"):
             chat_payload["session_id"] = st.session_state["chat_session_id"]
-        if st.session_state.get("geo_ready"):
+        if location_ui_enabled and st.session_state.get("geo_ready"):
             chat_payload["location"] = {
                 "lat": float(st.session_state["geo_lat"]),
                 "lng": float(st.session_state["geo_lng"]),
@@ -87,13 +140,20 @@ def _send_chat_message(message: str, *, timeout_sec: int) -> None:
                 "content": chat_result.get("assistant_reply", ""),
                 "recs": chat_result.get("recommendations", []),
                 "compare_cards": chat_result.get("compare_cards", []),
+                "debug": chat_result.get("debug", {}) or {},
             }
         )
     except requests.RequestException as exc:
         with st.chat_message("assistant"):
             st.markdown(f"请求失败：{exc}")
         st.session_state["dialog_messages"].append(
-            {"role": "assistant", "content": f"请求失败：{exc}", "recs": [], "compare_cards": []}
+            {
+                "role": "assistant",
+                "content": f"请求失败：{exc}",
+                "recs": [],
+                "compare_cards": [],
+                "debug": {"mode": "frontend_error", "error": str(exc), "agent_steps": []},
+            }
         )
 
 
@@ -104,6 +164,7 @@ if "dialog_messages" not in st.session_state:
             "content": "你好，我是你的外卖点餐助手。你可以直接说预算、口味、距离和送达时效，我会连续帮你调。",
             "recs": [],
             "compare_cards": [],
+            "debug": {},
         }
     ]
 if "chat_session_id" not in st.session_state:
@@ -135,59 +196,65 @@ with st.sidebar:
                 "content": "我们开始新一轮吧。你可以说“预算30以内，清淡不油腻，送达快一点”。",
                 "recs": [],
                 "compare_cards": [],
+                "debug": {},
             }
         ]
         st.rerun()
 
-    st.markdown("### 定位（推荐开启）")
-    st.caption("进入页面后会自动请求浏览器定位权限。没有定位也可以先聊天，补充定位后推荐会更准。")
-    if get_geolocation is None:
-        st.warning("定位组件不可用，请执行 pip install -r requirements.txt。你仍然可以先聊天。")
-    else:
-        if not st.session_state["geo_permission_requested"] or not st.session_state["geo_ready"]:
-            geo = get_geolocation()
-            st.session_state["geo_permission_requested"] = True
-            if geo and geo.get("coords"):
-                st.session_state["geo_lat"] = float(geo["coords"]["latitude"])
-                st.session_state["geo_lng"] = float(geo["coords"]["longitude"])
-                st.session_state["geo_accuracy_m"] = float(geo["coords"].get("accuracy", 0.0) or 0.0)
-                st.session_state["geo_ready"] = True
-
-        if st.session_state["geo_ready"]:
-            acc = st.session_state.get("geo_accuracy_m")
-            if isinstance(acc, (int, float)) and acc > 300:
-                st.warning(f"定位已获取，但精度较低（约{acc:.0f}米），建议重试一次定位或地址纠偏。")
-            else:
-                st.success("定位已就绪，后续推荐会更贴近你附近的店")
+    if location_ui_enabled:
+        st.markdown("### 定位（推荐开启）")
+        st.caption("进入页面后会自动请求浏览器定位权限。没有定位也可以先聊天，补充定位后推荐会更准。")
+        if get_geolocation is None:
+            st.warning("定位组件不可用，请执行 pip install -r requirements.txt。你仍然可以先聊天。")
         else:
-            st.info("定位暂未就绪。你可以先聊天，也可以在浏览器弹窗中点击“允许”来提升推荐准确度。")
+            if not st.session_state["geo_permission_requested"] or not st.session_state["geo_ready"]:
+                geo = get_geolocation()
+                st.session_state["geo_permission_requested"] = True
+                if geo and geo.get("coords"):
+                    st.session_state["geo_lat"] = float(geo["coords"]["latitude"])
+                    st.session_state["geo_lng"] = float(geo["coords"]["longitude"])
+                    st.session_state["geo_accuracy_m"] = float(geo["coords"].get("accuracy", 0.0) or 0.0)
+                    st.session_state["geo_ready"] = True
 
-        if st.button("🔁 重新请求定位权限", use_container_width=True):
-            st.session_state["geo_permission_requested"] = False
-            st.session_state["geo_ready"] = False
-            st.rerun()
-
-        st.markdown("#### 地址纠偏（定位不准时）")
-        correction_addr = st.text_input("输入你当前地址/地标", value="", placeholder="例如：静安寺地铁站")
-        correction_city = st.text_input("城市（可选）", value="")
-        if st.button("🧭 用地址校准定位", use_container_width=True):
-            if not correction_addr.strip():
-                st.warning("请先输入地址或地标")
+            if st.session_state["geo_ready"]:
+                acc = st.session_state.get("geo_accuracy_m")
+                if isinstance(acc, (int, float)) and acc > 300:
+                    st.warning(f"定位已获取，但精度较低（约{acc:.0f}米），建议重试一次定位或地址纠偏。")
+                else:
+                    st.success("定位已就绪，后续推荐会更贴近你附近的店")
             else:
-                try:
-                    geo_fix = call_geocode(correction_addr.strip(), correction_city.strip(), timeout_sec)
-                    if geo_fix.get("ok") and geo_fix.get("data"):
-                        d = geo_fix["data"]
-                        st.session_state["geo_lat"] = float(d.get("lat", st.session_state["geo_lat"]))
-                        st.session_state["geo_lng"] = float(d.get("lng", st.session_state["geo_lng"]))
-                        st.session_state["geo_ready"] = True
-                        st.success(f"已校准到：{d.get('formatted_address', correction_addr)}")
-                    else:
-                        st.warning(f"地址校准失败：{geo_fix.get('status', 'unknown')}")
-                except requests.RequestException:
-                    st.warning("地址校准请求失败，请稍后重试")
+                st.info("定位暂未就绪。你可以先聊天，也可以在浏览器弹窗中点击“允许”来提升推荐准确度。")
 
-    st.caption(f"当前坐标：{st.session_state['geo_lat']:.6f}, {st.session_state['geo_lng']:.6f}")
+            if st.button("🔁 重新请求定位权限", use_container_width=True):
+                st.session_state["geo_permission_requested"] = False
+                st.session_state["geo_ready"] = False
+                st.rerun()
+
+            st.markdown("#### 地址纠偏（定位不准时）")
+            correction_addr = st.text_input("输入你当前地址/地标", value="", placeholder="例如：静安寺地铁站")
+            correction_city = st.text_input("城市（可选）", value="")
+            if st.button("🧭 用地址校准定位", use_container_width=True):
+                if not correction_addr.strip():
+                    st.warning("请先输入地址或地标")
+                else:
+                    try:
+                        geo_fix = call_geocode(correction_addr.strip(), correction_city.strip(), timeout_sec)
+                        if geo_fix.get("ok") and geo_fix.get("data"):
+                            d = geo_fix["data"]
+                            st.session_state["geo_lat"] = float(d.get("lat", st.session_state["geo_lat"]))
+                            st.session_state["geo_lng"] = float(d.get("lng", st.session_state["geo_lng"]))
+                            st.session_state["geo_ready"] = True
+                            st.success(f"已校准到：{d.get('formatted_address', correction_addr)}")
+                        else:
+                            st.warning(f"地址校准失败：{geo_fix.get('status', 'unknown')}")
+                    except requests.RequestException:
+                        st.warning("地址校准请求失败，请稍后重试")
+
+        st.caption(f"当前坐标：{st.session_state['geo_lat']:.6f}, {st.session_state['geo_lng']:.6f}")
+    else:
+        st.markdown("### 定位")
+        st.caption("当前演示使用本地虚拟商家数据库，定位能力已关闭。")
+    _render_agent_panel()
 
 st.subheader("对话模式")
 for msg in st.session_state.get("dialog_messages", []):
@@ -196,7 +263,7 @@ for msg in st.session_state.get("dialog_messages", []):
         _render_chat_recommendations(msg.get("recs", []))
         _render_compare_cards(msg.get("compare_cards", []))
 
-if not st.session_state.get("geo_ready", False):
+if location_ui_enabled and not st.session_state.get("geo_ready", False):
     st.info("你可以先直接说预算、口味和时效；如果补充定位，我会把附近店铺排得更准。")
 
 chat_input = st.chat_input(

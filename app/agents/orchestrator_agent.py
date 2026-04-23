@@ -55,7 +55,12 @@ class OrchestratorAgent:
             "哪个热量更低",
             "哪个更适合减脂",
         ]
-        if any(k in text for k in question_markers) or any(k in compact for k in qa_commands):
+        has_question_intent = any(k in text for k in question_markers) or any(k in compact for k in qa_commands)
+        optimize_cues = ["更近", "更便宜", "更快", "预算", "距离", "送达", "不吃", "不要", "换", "再来", "改成", "降到"]
+        has_optimize_intent = any(k in text for k in optimize_cues)
+        if has_question_intent and has_last_query and has_optimize_intent:
+            return AgentDecision(mode="mixed_intent", reason="qa_plus_optimize", confidence=0.9)
+        if has_question_intent:
             return AgentDecision(mode="qa", reason="question_marker", confidence=0.95)
 
         smalltalk_exact = {"你好", "在吗", "哈喽", "谢谢", "多谢", "辛苦了", "再见", "收到", "好的", "ok"}
@@ -83,7 +88,6 @@ class OrchestratorAgent:
         if any(k in text for k in order_keywords):
             return AgentDecision(mode="recommend", reason="order_marker", confidence=0.9)
 
-        optimize_cues = ["更近", "更便宜", "更快", "预算", "距离", "送达", "不吃", "不要", "换", "再来", "改成", "降到"]
         if has_last_query and len(text) <= 60 and any(k in text for k in optimize_cues):
             return AgentDecision(mode="recommend", reason="followup_optimize", confidence=0.85)
 

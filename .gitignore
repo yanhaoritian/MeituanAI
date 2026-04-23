@@ -6,3 +6,4 @@ __pycache__/
 app/data/reason_metrics_logs/*.jsonl
 app/data/crawl_cache.json
 .venv/
+docs/
